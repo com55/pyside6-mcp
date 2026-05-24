@@ -27,17 +27,17 @@ Zero changes to your app's source code required.
 
 ## Installation
 
-Install pyside6-mcp into **your app's venv** (the target you want to debug):
+### Option 1 — Claude Code Plugin (MCP + skill in one command)
 
 ```bash
-# From PyPI (once published)
-uv add --dev pyside6-mcp
-
-# From GitHub
-uv add --dev "pyside6-mcp @ git+https://github.com/com55/pyside6-mcp"
+claude plugin install github:com55/pyside6-mcp
 ```
 
-Register the MCP server with Claude Code — pick the scope that fits:
+Installs the MCP server and the companion skill automatically.
+
+### Option 2 — MCP server only
+
+Register with Claude Code — pick the scope that fits:
 
 ```bash
 # user: available in every project (recommended for a debug tool)
@@ -54,6 +54,15 @@ Optionally set a custom port with `-e`:
 
 ```bash
 claude mcp add -s user -e PYSIDE6_MCP_PORT=7890 pyside6 -- uvx --from git+https://github.com/com55/pyside6-mcp pyside6-mcp
+```
+
+### Target app setup (required for both options)
+
+Install pyside6-mcp into **the app's venv** so the bridge module is importable:
+
+```bash
+cd your-pyside6-project
+uv add --dev "pyside6-mcp @ git+https://github.com/com55/pyside6-mcp"
 ```
 
 ## Usage

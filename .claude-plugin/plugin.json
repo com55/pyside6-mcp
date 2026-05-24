@@ -1,0 +1,7 @@
+{
+  "name": "pyside6-mcp",
+  "description": "Playwright-style MCP server for PySide6 apps — lets Claude see, control, and debug your Python desktop GUI without modifying your app's source code.",
+  "author": {
+    "name": "com55"
+  }
+}
