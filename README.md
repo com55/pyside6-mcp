@@ -37,10 +37,23 @@ uv add --dev pyside6-mcp
 uv add --dev "pyside6-mcp @ git+https://github.com/com55/pyside6-mcp"
 ```
 
-Register the MCP server with Claude Code (global):
+Register the MCP server with Claude Code — pick the scope that fits:
 
 ```bash
-claude mcp add --global pyside6 -- uv run --project /path/to/pyside6-mcp pyside6-mcp
+# user: available in every project (recommended for a debug tool)
+claude mcp add -s user pyside6 -- uvx --from git+https://github.com/com55/pyside6-mcp pyside6-mcp
+
+# project: only for the current project (saved to .mcp.json, can be committed)
+claude mcp add -s project pyside6 -- uvx --from git+https://github.com/com55/pyside6-mcp pyside6-mcp
+
+# local: only for the current project, not committed (default scope)
+claude mcp add pyside6 -- uvx --from git+https://github.com/com55/pyside6-mcp pyside6-mcp
+```
+
+Optionally set a custom port with `-e`:
+
+```bash
+claude mcp add -s user -e PYSIDE6_MCP_PORT=7890 pyside6 -- uvx --from git+https://github.com/com55/pyside6-mcp pyside6-mcp
 ```
 
 ## Usage
