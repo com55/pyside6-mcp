@@ -108,6 +108,22 @@ Claude uses the `launch_app`, `screenshot`, `get_widget_tree`, `find_widget`, `c
 | `get_logs(n?)` | Recent Python log records |
 | `eval_python(code)` | Execute Python inside the app process |
 
+## Claude Code Skill
+
+A companion skill is included at [`skills/pyside6-mcp/SKILL.md`](skills/pyside6-mcp/SKILL.md). It tells Claude when and how to use these tools automatically — no need to explain the workflow every time.
+
+Install it by copying the skill folder to your Claude skills directory:
+
+```bash
+# macOS / Linux
+cp -r skills/pyside6-mcp ~/.claude/skills/
+
+# Windows (PowerShell)
+Copy-Item -Recurse skills\pyside6-mcp "$env:USERPROFILE\.claude\skills\"
+```
+
+Once installed, Claude will automatically read the skill and use the correct workflow whenever you ask it to debug or interact with a PySide6 app.
+
 ## Architecture
 
 ```
