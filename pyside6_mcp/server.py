@@ -375,7 +375,10 @@ def stop_app(port: int = 7890) -> str:
 
 
 def main() -> None:
-    mcp.run()
+    # Suppress the FastMCP startup banner. On stdio transport it is printed to
+    # stderr, which MCP clients (e.g. Cursor) surface as scary-looking [error]
+    # log lines even though the server connects fine.
+    mcp.run(show_banner=False)
 
 
 if __name__ == "__main__":
