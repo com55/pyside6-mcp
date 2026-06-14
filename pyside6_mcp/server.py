@@ -11,7 +11,9 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+from typing import IO
 
 import httpx
 from fastmcp import FastMCP
@@ -22,16 +24,63 @@ BRIDGE = f"http://127.0.0.1:{PORT}"
 
 # pid → Popen, keyed by port so multiple apps on different ports are supported
 _procs: dict[int, subprocess.Popen] = {}
+# port → open log file handle that the launched app writes stdout/stderr to
+_proc_logs: dict[int, IO] = {}
+
+
+def _app_log_path(port: int) -> str:
+    """Deterministic file capturing the launched app's stdout/stderr."""
+    return os.path.join(tempfile.gettempdir(), f"pyside6-mcp-app-{port}.log")
+
+
+def _read_log_tail(port: int, n: int) -> str:
+    """Return the last n lines of the launched app's captured output."""
+    fh = _proc_logs.get(port)
+    if fh is not None:
+        try:
+            fh.flush()
+        except (ValueError, OSError):
+            pass
+    path = _app_log_path(port)
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    return "".join(lines[-n:]) if n > 0 else "".join(lines)
 
 mcp = FastMCP(
     "pyside6-mcp",
     instructions=(
-        "Controls and inspects a running PySide6 application. "
-        "The target app must have `install_bridge()` called before app.exec(). "
-        "Always start with screenshot() + get_widget_tree() to orient yourself. "
-        "Use widget IDs from the tree for subsequent operations."
+        "Controls and inspects a running PySide6 application, like Playwright for Qt GUIs.\n\n"
+        "PREFERRED WAY TO START THE APP: call the launch_app() tool. It spawns the app "
+        "with the bridge injected automatically (by monkey-patching QApplication), so the "
+        "user's source code needs ZERO modification. Do NOT edit the user's code to add "
+        "install_bridge() — that is only a fallback for when the user insists on starting "
+        "the app themselves outside of this server.\n\n"
+        "If the app is already running and reachable, you can skip launch_app(). "
+        "After the app is up, always start with screenshot() + get_widget_tree() to orient "
+        "yourself, then use the widget IDs from the tree for subsequent operations."
     ),
 )
+
+
+def _bridge_unreachable_error() -> RuntimeError:
+    return RuntimeError(
+        f"Cannot reach bridge on port {PORT}. "
+        "Start the app with the launch_app() tool — it injects the bridge automatically, "
+        "with no changes needed to the app's source code."
+    )
+
+
+def _bridge_http_error(exc: httpx.HTTPStatusError) -> RuntimeError:
+    """Turn a bridge 4xx/5xx into a readable message, surfacing its error body."""
+    detail = None
+    try:
+        detail = exc.response.json().get("error")
+    except Exception:
+        detail = exc.response.text.strip() or None
+    suffix = f": {detail}" if detail else ""
+    return RuntimeError(f"Bridge returned {exc.response.status_code}{suffix}")
 
 
 def _get(path: str, **params) -> dict:
@@ -39,11 +88,10 @@ def _get(path: str, **params) -> dict:
         r = httpx.get(f"{BRIDGE}{path}", params={k: v for k, v in params.items() if v is not None}, timeout=10)
         r.raise_for_status()
         return r.json()
-    except httpx.ConnectError:
-        raise RuntimeError(
-            f"Cannot reach bridge on port {PORT}. "
-            "Make sure install_bridge() was called in the target app."
-        )
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        raise _bridge_unreachable_error()
+    except httpx.HTTPStatusError as exc:
+        raise _bridge_http_error(exc)
 
 
 def _kill_proc_tree(proc: subprocess.Popen, timeout: float = 5.0) -> None:
@@ -111,11 +159,10 @@ def _post(path: str, data: dict) -> dict:
         r = httpx.post(f"{BRIDGE}{path}", json=data, timeout=10)
         r.raise_for_status()
         return r.json()
-    except httpx.ConnectError:
-        raise RuntimeError(
-            f"Cannot reach bridge on port {PORT}. "
-            "Make sure install_bridge() was called in the target app."
-        )
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        raise _bridge_unreachable_error()
+    except httpx.HTTPStatusError as exc:
+        raise _bridge_http_error(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +331,26 @@ def get_logs(n: int = 50) -> str:
 
 
 @mcp.tool()
+def get_app_output(port: int = 7890, n: int = 200) -> str:
+    """
+    Get the last n lines of the launched app's real stdout/stderr: print()
+    output, uncaught tracebacks, and Qt/console warnings.
+
+    This is the app's actual console output, captured because launch_app
+    redirects it to a log file. Use this to debug crashes or startup failures.
+    For structured Python logging records use get_logs() instead.
+
+    Only works for apps started via launch_app on this server.
+    """
+    if not os.path.exists(_app_log_path(port)):
+        return json.dumps({
+            "error": f"No captured output for port {port}. "
+                     "The app must be started via launch_app for output capture."
+        })
+    return json.dumps({"port": port, "output": _read_log_tail(port, n)}, indent=2)
+
+
+@mcp.tool()
 def eval_python(code: str) -> str:
     """
     Evaluate a Python expression or execute a statement inside the app process.
@@ -310,6 +377,10 @@ def launch_app(
     Launch a PySide6 app with the MCP bridge pre-injected, then wait until
     it's ready. After this returns, screenshot/click/etc. work immediately.
 
+    This is the preferred way to start the app. The bridge is injected by
+    monkey-patching QApplication in the launcher, so the app's source code needs
+    NO modification — never add install_bridge() to the user's code for this.
+
     command must invoke the pyside6_mcp launcher so the bridge auto-starts:
       "uv run python -m pyside6_mcp main.py"
       "python -m pyside6_mcp myapp.py"
@@ -318,16 +389,28 @@ def launch_app(
     port: bridge port (default 7890, set PYSIDE6_MCP_PORT env to override).
     timeout: seconds to wait for the bridge to come up (default 15).
 
+    The app's stdout/stderr is captured to a log file (see get_app_output()).
+
     One-time setup: pyside6-mcp must be installed in the app's venv:
       uv add --dev "pyside6-mcp @ file:///i:/_CodingWorkspace/pyside6-mcp"
     """
     bridge_url = f"http://127.0.0.1:{port}"
     env = {**os.environ, "PYSIDE6_MCP_PORT": str(port)}
 
+    # The child inherits our stdout otherwise, which on stdio transport is the
+    # MCP JSON-RPC channel — any output would corrupt it. Redirect to a log file
+    # instead of discarding it, so get_app_output() can surface the real output.
+    log_path = _app_log_path(port)
+    log_file = open(log_path, "w", encoding="utf-8")
+    _proc_logs.pop(port, None)
+    _proc_logs[port] = log_file
+
     popen_kwargs: dict = {
         "args": shlex.split(command),
         "cwd": cwd,
         "env": env,
+        "stdout": log_file,
+        "stderr": subprocess.STDOUT,
     }
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -339,17 +422,27 @@ def launch_app(
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            return json.dumps({"error": f"App exited early with code {proc.returncode}", "pid": proc.pid})
+            return json.dumps({
+                "error": f"App exited early with code {proc.returncode}",
+                "pid": proc.pid,
+                "log_file": log_path,
+                "output": _read_log_tail(port, 50),
+            })
         try:
             r = httpx.get(f"{bridge_url}/app", timeout=1)
             if r.status_code == 200:
-                return json.dumps({"ok": True, "pid": proc.pid, "app": r.json()})
-        except httpx.ConnectError:
+                return json.dumps({"ok": True, "pid": proc.pid, "log_file": log_path, "app": r.json()})
+        except (httpx.ConnectError, httpx.ConnectTimeout):
             pass
         time.sleep(0.4)
 
     _kill_proc_tree(proc)
-    return json.dumps({"error": f"Bridge did not start within {timeout}s", "pid": proc.pid})
+    return json.dumps({
+        "error": f"Bridge did not start within {timeout}s",
+        "pid": proc.pid,
+        "log_file": log_path,
+        "output": _read_log_tail(port, 50),
+    })
 
 
 @mcp.tool()
@@ -366,6 +459,16 @@ def stop_app(port: int = 7890) -> str:
         _kill_proc_tree(proc)
         result["pid"] = proc.pid
         result["returncode"] = proc.returncode
+
+    # Close our writable handle but leave the file on disk so get_app_output()
+    # can still surface the app's final output (e.g. shutdown tracebacks).
+    log_file = _proc_logs.pop(port, None)
+    if log_file is not None:
+        try:
+            log_file.close()
+        except OSError:
+            pass
+        result["log_file"] = _app_log_path(port)
     elif not quit_status.get("bridge_stopped"):
         if not quit_status.get("bridge_reachable"):
             return json.dumps({"error": f"No app tracked on port {port} and bridge unreachable"})

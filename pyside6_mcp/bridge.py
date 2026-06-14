@@ -8,6 +8,7 @@ Usage (add to your app before app.exec()):
 import base64
 import json
 import logging
+import sys
 import threading
 import weakref
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -458,4 +459,7 @@ def install_bridge(port: int = 7890) -> None:
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     logger.info("pyside6-mcp bridge started on port %d", port)
-    print(f"[pyside6-mcp] Bridge listening on http://127.0.0.1:{port}")
+    # Never write to stdout: when the app is spawned by the MCP server's
+    # launch_app tool it inherits the server's stdout, which is the JSON-RPC
+    # channel. Anything printed there corrupts the protocol.
+    print(f"[pyside6-mcp] Bridge listening on http://127.0.0.1:{port}", file=sys.stderr)

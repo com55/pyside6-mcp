@@ -19,6 +19,11 @@ description: >
 Claude → MCP tools → pyside6-mcp server → HTTP bridge (port 7890) → PySide6 app
 ```
 
+> **Never edit the user's source code to add `install_bridge()`.**
+> Start the app with `launch_app()` instead — it injects the bridge automatically by
+> monkey-patching `QApplication` (zero code modification). `install_bridge()` is only a
+> fallback for when the user insists on running the app themselves, outside this server.
+
 ## Prerequisites
 
 pyside6-mcp must be installed in the target app's venv:
@@ -71,7 +76,8 @@ scroll(dy=-3, widget_id="2")          # scroll up
 ```python
 screenshot()            # see result
 get_widget_info("4")    # check properties/state
-get_logs(n=20)          # check Python logs from the app
+get_logs(n=20)          # check Python logging records from the app
+get_app_output(n=50)    # check raw stdout/stderr (prints, tracebacks)
 ```
 
 ---
@@ -92,7 +98,8 @@ get_logs(n=20)          # check Python logs from the app
 | `type_text(text, widget_id?)` | Keyboard input |
 | `press_key(key)` | Named key: `enter`, `escape`, `tab`, `up`/`down`/`left`/`right`, `f5`, or any character |
 | `scroll(dy, widget_id?, dx?)` | Scroll (dy > 0 = down, dy < 0 = up) |
-| `get_logs(n?)` | Recent Python log records (default 50) |
+| `get_logs(n?)` | Recent Python `logging` records via the bridge (default 50) |
+| `get_app_output(port?, n?)` | Raw stdout/stderr of the launched app: `print()`, tracebacks, Qt warnings (default 200 lines) |
 | `eval_python(code)` | Execute Python inside the app process |
 
 ### `eval_python` context
@@ -150,3 +157,4 @@ screenshot()
 - **Bridge must be running** — if tools return a connection error, call `launch_app` first
 - **Qt operations run on the main thread** — the bridge marshals automatically, but if the app is hung, tools will timeout after 5 s
 - **`eval_python` runs real code in the app process** — use for inspection only, not production state changes
+- **`get_logs` vs `get_app_output`** — `get_logs` returns Python `logging` records via the bridge; `get_app_output` returns the raw stdout/stderr (`print()`, uncaught tracebacks). If the app crashes on startup, use `get_app_output` — it reads from a file and works even when the bridge never came up (only for apps started via `launch_app`)
