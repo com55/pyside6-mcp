@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pyside6": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/com55/pyside6-mcp", "pyside6-mcp"]
+    }
+  }
+}

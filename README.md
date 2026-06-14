@@ -1,9 +1,9 @@
 # pyside6-mcp
 
-Playwright-style MCP server for PySide6 apps — lets Claude see, control, and debug your Python desktop GUI without modifying your app's source code.
+Playwright-style MCP server for PySide6 apps — lets AI assistants see, control, and debug your Python desktop GUI without modifying your app's source code.
 
 ```
-Claude → MCP tools → pyside6-mcp server → HTTP bridge → PySide6 app
+AI assistant → MCP tools → pyside6-mcp server → HTTP bridge → PySide6 app
 ```
 
 ## Features
@@ -27,7 +27,25 @@ Zero changes to your app's source code required.
 
 ## Installation
 
-### Option 1 — Claude Code Plugin (MCP + skill in one command)
+The MCP server (stdio) and the in-app bridge are separate:
+
+| Component | Where it runs | Needs PySide6? |
+|-----------|---------------|----------------|
+| **MCP server** (`pyside6-mcp`) | AI client's MCP process | No |
+| **Bridge** (`python -m pyside6_mcp …`) | Inside your PySide6 app | Yes |
+
+### Target app setup (required)
+
+Install pyside6-mcp into **the app's venv** so the bridge module is importable:
+
+```bash
+cd your-pyside6-project
+uv add --dev "pyside6-mcp @ git+https://github.com/com55/pyside6-mcp"
+```
+
+### MCP server — Claude Code
+
+#### Option 1 — Plugin (MCP + skill in one command)
 
 ```bash
 claude plugin install github:com55/pyside6-mcp
@@ -35,7 +53,7 @@ claude plugin install github:com55/pyside6-mcp
 
 Installs the MCP server and the companion skill automatically.
 
-### Option 2 — MCP server only
+#### Option 2 — MCP server only
 
 Register with Claude Code — pick the scope that fits:
 
@@ -56,14 +74,79 @@ Optionally set a custom port with `-e`:
 claude mcp add -s user -e PYSIDE6_MCP_PORT=7890 pyside6 -- uvx --from git+https://github.com/com55/pyside6-mcp pyside6-mcp
 ```
 
-### Target app setup (required for both options)
+### MCP server — Cursor
 
-Install pyside6-mcp into **the app's venv** so the bridge module is importable:
+Add the server to your MCP config. Requires [uv](https://docs.astral.sh/uv/) on `PATH`.
 
-```bash
-cd your-pyside6-project
-uv add --dev "pyside6-mcp @ git+https://github.com/com55/pyside6-mcp"
+**Global** (available in every project — recommended):
+
+| OS | Config file |
+|----|-------------|
+| Windows | `%USERPROFILE%\.cursor\mcp.json` |
+| macOS / Linux | `~/.cursor/mcp.json` |
+
+**Project** (committed with the repo): `.cursor/mcp.json`
+
+```json
+{
+  "mcpServers": {
+    "pyside6": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/com55/pyside6-mcp", "pyside6-mcp"]
+    }
+  }
+}
 ```
+
+Optional custom port:
+
+```json
+"env": { "PYSIDE6_MCP_PORT": "7890" }
+```
+
+After saving, reload MCP servers in **Cursor Settings → MCP** (toggle off/on or restart Cursor).
+
+See [`examples/cursor-mcp-config.json`](examples/cursor-mcp-config.json) for a copy-paste template.
+
+### MCP server — VS Code / GitHub Copilot
+
+VS Code MCP uses the same stdio format. Add to your user or workspace MCP config
+(**Settings → search "MCP" → Edit in settings.json**, or `.vscode/mcp.json` depending on your setup):
+
+```json
+{
+  "mcpServers": {
+    "pyside6": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/com55/pyside6-mcp", "pyside6-mcp"]
+    }
+  }
+}
+```
+
+### MCP server — other clients (Windsurf, Cline, OpenCode, …)
+
+Any MCP client that supports **stdio** servers can use this config block:
+
+```json
+{
+  "mcpServers": {
+    "pyside6": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/com55/pyside6-mcp", "pyside6-mcp"],
+      "env": {
+        "PYSIDE6_MCP_PORT": "7890"
+      }
+    }
+  }
+}
+```
+
+Place it wherever that client expects MCP config (user-level or project-level).
+See [`examples/mcp-config.json`](examples/mcp-config.json) for the canonical template.
+
+> **Note:** `uvx` downloads and runs the MCP server in an isolated env — PySide6 is **not**
+> required there. PySide6 is only needed in the target app's venv (bridge setup above).
 
 ## Usage
 
@@ -87,16 +170,16 @@ from pyside6_mcp import install_bridge
 install_bridge()
 ```
 
-### From Claude
+### From your AI assistant
 
-Once the app is running with the bridge active, ask Claude:
+Once the app is running with the bridge active, ask your assistant:
 
 > "Screenshot the app and click the Apply button"
 > "Why is the checkbox disabled? Inspect its state."
 > "Fill in the form and submit it"
 > "Show me the last 20 log lines from the app"
 
-Claude uses the `launch_app`, `screenshot`, `get_widget_tree`, `find_widget`, `click`, `type_text`, `get_logs`, and other tools automatically.
+Your assistant uses the `launch_app`, `screenshot`, `get_widget_tree`, `find_widget`, `click`, `type_text`, `get_logs`, and other tools automatically.
 
 ## Tools
 
@@ -147,7 +230,10 @@ pyside6_mcp/
 
 ## Examples
 
-See [`examples/test_app.py`](examples/test_app.py) for a minimal PySide6 app you can use to verify the setup.
+- [`examples/test_app.py`](examples/test_app.py) — minimal PySide6 app to verify the bridge
+- [`examples/mcp-config.json`](examples/mcp-config.json) — generic MCP config (Cursor, VS Code, Windsurf, …)
+- [`examples/cursor-mcp-config.json`](examples/cursor-mcp-config.json) — Cursor-specific template
+- [`examples/claude-mcp-config.json`](examples/claude-mcp-config.json) — same format, kept for reference
 
 ## License
 
