@@ -9,6 +9,7 @@ Usage:
 The bridge is injected by monkey-patching QApplication.__init__ before
 the target script runs. The target app requires zero modifications.
 """
+import os
 import runpy
 import sys
 
@@ -17,6 +18,7 @@ def _patch_qapp() -> None:
     from PySide6.QtWidgets import QApplication
     from pyside6_mcp.bridge import install_bridge
 
+    port = int(os.environ.get("PYSIDE6_MCP_PORT", "7890"))
     _orig = QApplication.__init__
     _done = []
 
@@ -24,7 +26,7 @@ def _patch_qapp() -> None:
         _orig(self, *args, **kwargs)
         if not _done:
             _done.append(True)
-            install_bridge()
+            install_bridge(port=port)
 
     QApplication.__init__ = _patched
 

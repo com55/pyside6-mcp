@@ -212,6 +212,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(_call_main(lambda: _qt_find(body)))
             elif path == "/eval":
                 self._send(_call_main(lambda: _qt_eval(body)))
+            elif path == "/quit":
+                self._send(_call_main(_qt_quit))
             else:
                 self._send({"error": "not found"}, 404)
         except Exception as exc:
@@ -410,6 +412,14 @@ def _qt_app_info() -> dict:
             for s in app.screens()
         ],
     }
+
+
+def _qt_quit() -> dict:
+    app = QApplication.instance()
+    if not app:
+        return {"error": "No QApplication"}
+    app.quit()
+    return {"ok": True}
 
 
 def _qt_eval(body: dict) -> dict:

@@ -8,6 +8,7 @@ Run as MCP server:
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -43,6 +44,66 @@ def _get(path: str, **params) -> dict:
             f"Cannot reach bridge on port {PORT}. "
             "Make sure install_bridge() was called in the target app."
         )
+
+
+def _kill_proc_tree(proc: subprocess.Popen, timeout: float = 5.0) -> None:
+    """Terminate a process and all its children (e.g. uv → python → app)."""
+    if proc.poll() is not None:
+        return
+
+    pid = proc.pid
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            check=False,
+        )
+    else:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except ProcessLookupError:
+            proc.terminate()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if sys.platform != "win32":
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except ProcessLookupError:
+                proc.kill()
+            proc.wait(timeout=timeout)
+
+
+def _bridge_gone(exc: Exception) -> bool:
+    """True when the bridge is no longer accepting connections."""
+    return isinstance(exc, (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout))
+
+
+def _request_app_quit(port: int, timeout: float = 5.0) -> dict:
+    """Ask the app to quit gracefully via the bridge, then wait for it to stop."""
+    bridge_url = f"http://127.0.0.1:{port}"
+    try:
+        r = httpx.post(f"{bridge_url}/quit", timeout=5)
+        r.raise_for_status()
+    except httpx.ConnectError:
+        return {"bridge_reachable": False}
+    except httpx.HTTPError as exc:
+        if _bridge_gone(exc):
+            return {"bridge_reachable": True, "bridge_stopped": True}
+        return {"bridge_reachable": True, "quit_error": str(exc)}
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            httpx.get(f"{bridge_url}/app", timeout=0.5)
+        except httpx.HTTPError as exc:
+            if _bridge_gone(exc):
+                return {"bridge_reachable": True, "bridge_stopped": True, "quit": r.json()}
+            raise
+        time.sleep(0.2)
+
+    return {"bridge_reachable": True, "bridge_stopped": False, "quit": r.json()}
 
 
 def _post(path: str, data: dict) -> dict:
@@ -263,13 +324,16 @@ def launch_app(
     bridge_url = f"http://127.0.0.1:{port}"
     env = {**os.environ, "PYSIDE6_MCP_PORT": str(port)}
 
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
-    proc = subprocess.Popen(
-        shlex.split(command),
-        cwd=cwd,
-        env=env,
-        creationflags=flags,
-    )
+    popen_kwargs: dict = {
+        "args": shlex.split(command),
+        "cwd": cwd,
+        "env": env,
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(**popen_kwargs)
     _procs[port] = proc
 
     deadline = time.monotonic() + timeout
@@ -284,7 +348,7 @@ def launch_app(
             pass
         time.sleep(0.4)
 
-    proc.terminate()
+    _kill_proc_tree(proc)
     return json.dumps({"error": f"Bridge did not start within {timeout}s", "pid": proc.pid})
 
 
@@ -293,15 +357,21 @@ def stop_app(port: int = 7890) -> str:
     """
     Stop a previously launched app (started via launch_app).
     """
+    result: dict = {"ok": True, "port": port}
+    quit_status = _request_app_quit(port)
+    result["quit"] = quit_status
+
     proc = _procs.pop(port, None)
-    if proc is None:
-        return json.dumps({"error": f"No app tracked on port {port}"})
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    return json.dumps({"ok": True, "returncode": proc.returncode})
+    if proc is not None:
+        _kill_proc_tree(proc)
+        result["pid"] = proc.pid
+        result["returncode"] = proc.returncode
+    elif not quit_status.get("bridge_stopped"):
+        if not quit_status.get("bridge_reachable"):
+            return json.dumps({"error": f"No app tracked on port {port} and bridge unreachable"})
+        return json.dumps({"error": f"App on port {port} did not stop after quit request", **result})
+
+    return json.dumps(result)
 
 
 def main() -> None:
