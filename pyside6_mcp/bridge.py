@@ -25,6 +25,25 @@ _log_records: list[dict] = []
 _widget_registry: dict[str, weakref.ref] = {}
 _widget_by_ptr: dict[int, str] = {}
 
+# ---------------------------------------------------------------------------
+# Readiness tracking (pure helpers + shared state)
+# ---------------------------------------------------------------------------
+
+# Monotonic timestamps recorded by the event filter on the main thread.
+_first_paint_at: float | None = None
+_last_activity_at: float | None = None
+_readiness_filter: "QObject | None" = None
+
+
+def _window_is_ready(w: dict) -> bool:
+    """A window counts as ready when it is visible with a non-zero size."""
+    return bool(w.get("visible")) and int(w.get("w", 0)) > 0 and int(w.get("h", 0)) > 0
+
+
+def _ready_from(has_visible_window: bool, idle_ms: float, quiet_ms: float) -> bool:
+    """Ready = a visible sized window exists AND the UI has been quiet long enough."""
+    return bool(has_visible_window) and idle_ms >= quiet_ms
+
 
 # ---------------------------------------------------------------------------
 # Thread-safety: marshal Qt calls to the main thread via postEvent
@@ -59,6 +78,33 @@ class _MainProxy(QObject):
         return super().event(e)
 
 
+class _ReadinessFilter(QObject):
+    """Global event filter (main thread) that records window paint/activity times."""
+
+    _PAINT = {QEvent.Type.Expose, QEvent.Type.Paint}
+    _ACTIVITY = {
+        QEvent.Type.Show,
+        QEvent.Type.Resize,
+        QEvent.Type.LayoutRequest,
+    }
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        global _first_paint_at, _last_activity_at
+        et = event.type()
+        if et in self._PAINT or et in self._ACTIVITY:
+            import time as _t
+
+            now = _t.monotonic()
+            if et in self._ACTIVITY:
+                _last_activity_at = now
+            if _first_paint_at is None and isinstance(obj, QWidget) and obj.isWindow():
+                if et in self._PAINT and obj.isVisible() and obj.width() > 0 and obj.height() > 0:
+                    _first_paint_at = now
+                    if _last_activity_at is None:
+                        _last_activity_at = now
+        return False
+
+
 _proxy: _MainProxy | None = None
 
 
@@ -67,7 +113,11 @@ def _call_main(func, timeout: float = 5.0):
     sync = threading.Event()
     QApplication.instance().postEvent(_proxy, _CallEvent(func, sync, result))
     if not sync.wait(timeout):
-        raise TimeoutError("Qt main thread call timed out after 5 s")
+        raise TimeoutError(
+            f"Qt main thread call timed out after {timeout} s — the main thread is likely "
+            "blocked by a modal dialog (QDialog.exec()/QMessageBox) running a nested "
+            "event loop. Close the dialog, or use trigger_action/get_app_status."
+        )
     tag, val = result[0]
     if tag == "err":
         raise val
@@ -153,6 +203,8 @@ class _LogCapture(logging.Handler):
 # ---------------------------------------------------------------------------
 
 class _Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):  # silence request log
         pass
 
@@ -187,6 +239,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send({"logs": _log_records[-n:]})
             elif path == "/app":
                 self._send(_call_main(_qt_app_info))
+            elif path == "/ready":
+                quiet = float(qs.get("quiet_ms", ["500"])[0])
+                self._send(_call_main(lambda: _qt_readiness(quiet)))
+            elif path == "/idle":
+                self._send(_call_main(_qt_idle))
+            elif path == "/actions":
+                self._send(_call_main(_qt_list_actions))
             else:
                 self._send({"error": "not found"}, 404)
         except Exception as exc:
@@ -215,6 +274,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(_call_main(lambda: _qt_eval(body)))
             elif path == "/quit":
                 self._send(_call_main(_qt_quit))
+            elif path == "/action":
+                self._send(_call_main(lambda: _qt_trigger_action(body)))
             else:
                 self._send({"error": "not found"}, 404)
         except Exception as exc:
@@ -229,6 +290,18 @@ class _ThreadedHTTP(ThreadingMixIn, HTTPServer):
 # Qt operations (always called via _call_main → runs in main thread)
 # ---------------------------------------------------------------------------
 
+def _topmost_capture_target(app) -> QWidget | None:
+    """Prefer the active window, then a visible modal dialog, then first visible top-level."""
+    active = app.activeWindow()
+    if active is not None and active.isVisible():
+        return active
+    visible = [w for w in app.topLevelWidgets() if w.isVisible()]
+    modal = [w for w in visible if w.isModal()]
+    if modal:
+        return modal[-1]
+    return visible[0] if visible else None
+
+
 def _qt_screenshot(widget_id: str | None = None) -> str:
     if widget_id:
         w = _resolve(widget_id)
@@ -237,8 +310,11 @@ def _qt_screenshot(widget_id: str | None = None) -> str:
         pixmap = w.grab()
     else:
         app = QApplication.instance()
-        tops = [w for w in app.topLevelWidgets() if w.isVisible()]
-        pixmap = tops[0].grab() if tops else app.primaryScreen().grabWindow(0)
+        target = _topmost_capture_target(app)
+        if target is not None:
+            pixmap = target.grab()
+        else:
+            pixmap = app.primaryScreen().grabWindow(0)
 
     buf = QBuffer()
     buf.open(QIODevice.OpenMode.ReadWrite)
@@ -394,6 +470,97 @@ def _qt_find(body: dict) -> dict:
     return {"widgets": results, "count": len(results)}
 
 
+def _qt_idle() -> dict:
+    import time as _t
+
+    if _last_activity_at is None:
+        return {"idle_ms": 0.0}
+    return {"idle_ms": round((_t.monotonic() - _last_activity_at) * 1000.0, 1)}
+
+
+def _qt_list_actions() -> dict:
+    from PySide6.QtWidgets import QWidget as _QWidget
+
+    app = QApplication.instance()
+    actions = []
+    seen = set()
+    for window in app.topLevelWidgets():
+        if not window.isVisible():
+            continue
+        candidates = [window, *window.findChildren(_QWidget)]
+        for widget in candidates:
+            for action in widget.actions():
+                key = id(action)
+                if key in seen or action.isSeparator():
+                    continue
+                seen.add(key)
+                actions.append({
+                    "name": action.objectName() or None,
+                    "text": action.text().replace("&", "") or None,
+                    "enabled": action.isEnabled(),
+                    "checkable": action.isCheckable(),
+                    "checked": action.isChecked() if action.isCheckable() else None,
+                    "shortcut": action.shortcut().toString() or None,
+                })
+    return {"actions": actions, "count": len(actions)}
+
+
+def _qt_trigger_action(body: dict) -> dict:
+    from PySide6.QtWidgets import QWidget as _QWidget
+
+    name = body.get("name")
+    text = body.get("text")
+    if not name and not text:
+        return {"error": "Provide 'name' (objectName) or 'text'"}
+
+    app = QApplication.instance()
+    for window in app.topLevelWidgets():
+        candidates = [window, *window.findChildren(_QWidget)]
+        for widget in candidates:
+            for action in widget.actions():
+                if action.isSeparator():
+                    continue
+                if (name and action.objectName() == name) or (
+                    text and action.text().replace("&", "") == text
+                ):
+                    if not action.isEnabled():
+                        return {"error": f"Action {name or text!r} is disabled"}
+                    action.trigger()
+                    return {"ok": True, "triggered": name or text}
+    return {"error": f"Action {name or text!r} not found"}
+
+
+def _qt_readiness(quiet_ms: float = 500.0) -> dict:
+    import time as _t
+
+    app = QApplication.instance()
+    windows = []
+    has_ready_window = False
+    for w in app.topLevelWidgets():
+        wd = {
+            "title": w.windowTitle() or None,
+            "visible": w.isVisible(),
+            "w": w.width(),
+            "h": w.height(),
+        }
+        if _window_is_ready(wd):
+            has_ready_window = True
+        if w.isVisible():
+            windows.append(wd)
+
+    if _last_activity_at is None:
+        idle_ms = 0.0
+    else:
+        idle_ms = (_t.monotonic() - _last_activity_at) * 1000.0
+
+    return {
+        "ready": _ready_from(has_ready_window, idle_ms, quiet_ms),
+        "has_visible_window": has_ready_window,
+        "idle_ms": round(idle_ms, 1),
+        "windows": windows,
+    }
+
+
 def _qt_app_info() -> dict:
     app = QApplication.instance()
     aw = app.activeWindow()
@@ -451,9 +618,11 @@ def install_bridge(port: int = 7890) -> None:
         from pyside6_mcp import install_bridge
         install_bridge()
     """
-    global _proxy
+    global _proxy, _readiness_filter
     # Must be created here (main thread) so Qt gives it main-thread affinity.
     _proxy = _MainProxy()
+    _readiness_filter = _ReadinessFilter()
+    QApplication.instance().installEventFilter(_readiness_filter)
     logging.root.addHandler(_LogCapture())
     server = _ThreadedHTTP(("127.0.0.1", port), _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)

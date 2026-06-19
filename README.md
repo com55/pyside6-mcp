@@ -181,13 +181,18 @@ Once the app is running with the bridge active, ask your assistant:
 
 Your assistant uses the `launch_app`, `screenshot`, `get_widget_tree`, `find_widget`, `click`, `type_text`, `get_logs`, and other tools automatically.
 
+`launch_app` returns only when the UI is ready (a visible top-level window that has been quiet for at least 500 ms), not merely when the bridge HTTP server is up. Default `timeout` is 30 seconds.
+
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `launch_app(command, cwd, port, timeout)` | Launch app and wait for bridge |
+| `launch_app(command, cwd, port, timeout)` | Launch app and wait for UI readiness |
+| `wait_until_ready(timeout, quiet_ms)` | Wait for UI readiness on an already-running app |
+| `wait_for_idle(timeout, quiet_ms)` | Wait until UI has been quiet after an action |
+| `get_app_status(port)` | Process + bridge health; detects likely modal blocks |
 | `stop_app(port)` | Stop a launched app |
-| `screenshot(widget_id?)` | Capture window or specific widget |
+| `screenshot(widget_id?)` | Capture window or specific widget (modal/active-window aware) |
 | `get_widget_tree()` | Full widget hierarchy with IDs |
 | `get_widget_info(widget_id)` | Detailed properties of one widget |
 | `get_app_state()` | Active window, focus, screen info |
@@ -197,7 +202,10 @@ Your assistant uses the `launch_app`, `screenshot`, `get_widget_tree`, `find_wid
 | `type_text(text, widget_id?)` | Keyboard input |
 | `press_key(key)` | Named key: enter, escape, tab, up/down, f5, … |
 | `scroll(dy, widget_id?, dx?)` | Scroll wheel |
+| `list_actions()` | List QAction menu/toolbar items |
+| `trigger_action(name?, text?)` | Trigger a QAction without clicking menus |
 | `get_logs(n?)` | Recent Python log records |
+| `get_app_output(port?, n?)` | Raw stdout/stderr from launched app |
 | `eval_python(code)` | Execute Python inside the app process |
 
 ## Claude Code Skill

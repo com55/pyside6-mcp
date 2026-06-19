@@ -22,6 +22,20 @@ from fastmcp.utilities.types import Image
 PORT = int(os.environ.get("PYSIDE6_MCP_PORT", "7890"))
 BRIDGE = f"http://127.0.0.1:{PORT}"
 
+_client: httpx.Client | None = None
+
+
+def _get_client() -> httpx.Client:
+    """One keep-alive client reused across calls (avoids per-call TCP setup)."""
+    global _client
+    if _client is None:
+        _client = httpx.Client(
+            base_url=BRIDGE,
+            timeout=10,
+            limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
+        )
+    return _client
+
 # pid → Popen, keyed by port so multiple apps on different ports are supported
 _procs: dict[int, subprocess.Popen] = {}
 # port → open log file handle that the launched app writes stdout/stderr to
@@ -83,12 +97,70 @@ def _bridge_http_error(exc: httpx.HTTPStatusError) -> RuntimeError:
     return RuntimeError(f"Bridge returned {exc.response.status_code}{suffix}")
 
 
+_TRANSIENT_EXC = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+)
+
+
+def _should_retry(exc: Exception) -> bool:
+    """True for transient connection hiccups that warrant a quick retry."""
+    return isinstance(exc, _TRANSIENT_EXC)
+
+
+def _app_status_from(proc_alive: bool, exit_code, bridge_ok: bool, timed_out: bool) -> dict:
+    """Combine process liveness with bridge responsiveness into one status dict."""
+    return {
+        "running": bool(proc_alive),
+        "exit_code": exit_code,
+        "bridge_responsive": bool(bridge_ok),
+        "likely_modal_block": bool(proc_alive and timed_out and not bridge_ok),
+    }
+
+
+_RETRY_BACKOFFS = (0.1, 0.3, 0.6)
+
+
+def _request_with_retry(method: str, path: str, **kwargs) -> httpx.Response:
+    """Issue a request on the pooled client, retrying transient connection errors."""
+    client = _get_client()
+    last_exc: Exception | None = None
+    for attempt in range(len(_RETRY_BACKOFFS) + 1):
+        try:
+            r = client.request(method, path, **kwargs)
+            r.raise_for_status()
+            return r
+        except httpx.HTTPStatusError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if not _should_retry(exc) or attempt == len(_RETRY_BACKOFFS):
+                break
+            time.sleep(_RETRY_BACKOFFS[attempt])
+    assert last_exc is not None
+    raise last_exc
+
+
 def _get(path: str, **params) -> dict:
     try:
-        r = httpx.get(f"{BRIDGE}{path}", params={k: v for k, v in params.items() if v is not None}, timeout=10)
-        r.raise_for_status()
+        r = _request_with_retry(
+            "GET", path, params={k: v for k, v in params.items() if v is not None}
+        )
         return r.json()
-    except (httpx.ConnectError, httpx.ConnectTimeout):
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.RemoteProtocolError):
+        raise _bridge_unreachable_error()
+    except httpx.HTTPStatusError as exc:
+        raise _bridge_http_error(exc)
+
+
+def _post(path: str, data: dict) -> dict:
+    try:
+        r = _request_with_retry("POST", path, json=data)
+        return r.json()
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.RemoteProtocolError):
         raise _bridge_unreachable_error()
     except httpx.HTTPStatusError as exc:
         raise _bridge_http_error(exc)
@@ -152,17 +224,6 @@ def _request_app_quit(port: int, timeout: float = 5.0) -> dict:
         time.sleep(0.2)
 
     return {"bridge_reachable": True, "bridge_stopped": False, "quit": r.json()}
-
-
-def _post(path: str, data: dict) -> dict:
-    try:
-        r = httpx.post(f"{BRIDGE}{path}", json=data, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except (httpx.ConnectError, httpx.ConnectTimeout):
-        raise _bridge_unreachable_error()
-    except httpx.HTTPStatusError as exc:
-        raise _bridge_http_error(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -371,11 +432,14 @@ def launch_app(
     command: str,
     cwd: str | None = None,
     port: int = 7890,
-    timeout: int = 15,
+    timeout: int = 30,
 ) -> str:
     """
     Launch a PySide6 app with the MCP bridge pre-injected, then wait until
-    it's ready. After this returns, screenshot/click/etc. work immediately.
+    the UI is ready. After this returns, screenshot/click/etc. work immediately.
+
+    Ready means a visible top-level window that has been quiet (no layout/paint
+    activity) for at least 500 ms — not merely that the bridge HTTP server is up.
 
     This is the preferred way to start the app. The bridge is injected by
     monkey-patching QApplication in the launcher, so the app's source code needs
@@ -387,7 +451,7 @@ def launch_app(
 
     cwd: working directory for the app process.
     port: bridge port (default 7890, set PYSIDE6_MCP_PORT env to override).
-    timeout: seconds to wait for the bridge to come up (default 15).
+    timeout: seconds to wait for UI readiness (default 30).
 
     The app's stdout/stderr is captured to a log file (see get_app_output()).
 
@@ -406,7 +470,7 @@ def launch_app(
     _proc_logs[port] = log_file
 
     popen_kwargs: dict = {
-        "args": shlex.split(command),
+        "args": shlex.split(command, posix=(sys.platform != "win32")),
         "cwd": cwd,
         "env": env,
         "stdout": log_file,
@@ -420,6 +484,7 @@ def launch_app(
     _procs[port] = proc
 
     deadline = time.monotonic() + timeout
+    last_ready: dict | None = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return json.dumps({
@@ -429,13 +494,28 @@ def launch_app(
                 "output": _read_log_tail(port, 50),
             })
         try:
-            r = httpx.get(f"{bridge_url}/app", timeout=1)
+            r = httpx.get(f"{bridge_url}/ready", timeout=1)
             if r.status_code == 200:
-                return json.dumps({"ok": True, "pid": proc.pid, "log_file": log_path, "app": r.json()})
+                last_ready = r.json()
+                if last_ready.get("ready"):
+                    return json.dumps({
+                        "ok": True,
+                        "pid": proc.pid,
+                        "log_file": log_path,
+                        "ready": last_ready,
+                    })
         except (httpx.ConnectError, httpx.ConnectTimeout):
             pass
         time.sleep(0.4)
 
+    if last_ready is not None:
+        return json.dumps({
+            "error": f"App started but UI not ready within {timeout}s",
+            "pid": proc.pid,
+            "log_file": log_path,
+            "ready": last_ready,
+            "output": _read_log_tail(port, 50),
+        })
     _kill_proc_tree(proc)
     return json.dumps({
         "error": f"Bridge did not start within {timeout}s",
@@ -443,6 +523,105 @@ def launch_app(
         "log_file": log_path,
         "output": _read_log_tail(port, 50),
     })
+
+
+@mcp.tool()
+def wait_until_ready(timeout: int = 30, quiet_ms: int = 500) -> str:
+    """
+    Wait until the app UI is ready: a visible top-level window that has been
+    quiet (no layout/paint activity) for `quiet_ms` milliseconds.
+
+    Use after an action that reloads or rebuilds the UI. Returns the readiness
+    snapshot. Does not launch anything — the app must already be running.
+    """
+    deadline = time.monotonic() + timeout
+    last: dict | None = None
+    while time.monotonic() < deadline:
+        try:
+            last = _get("/ready", quiet_ms=quiet_ms)
+            if last.get("ready"):
+                return json.dumps({"ok": True, "ready": last})
+        except RuntimeError:
+            pass
+        time.sleep(0.3)
+    return json.dumps({"ok": False, "error": f"UI not ready within {timeout}s", "ready": last})
+
+
+@mcp.tool()
+def wait_for_idle(timeout: float = 5.0, quiet_ms: int = 300) -> str:
+    """
+    Wait until the app's UI has been quiet (no layout/paint activity) for
+    `quiet_ms` ms, or until `timeout` seconds elapse. Call after a click or
+    action that triggers async work, before taking a screenshot.
+    """
+    deadline = time.monotonic() + timeout
+    last_idle = 0.0
+    while time.monotonic() < deadline:
+        try:
+            last_idle = float(_get("/idle").get("idle_ms", 0.0))
+        except RuntimeError:
+            break
+        if last_idle >= quiet_ms:
+            return json.dumps({"ok": True, "idle_ms": last_idle})
+        time.sleep(0.1)
+    return json.dumps({"ok": False, "idle_ms": last_idle, "timeout": timeout})
+
+
+@mcp.tool()
+def get_app_status(port: int = 7890) -> str:
+    """
+    Report combined health of a launched app: whether the process is alive,
+    its exit code, whether the bridge responds, and whether the main thread is
+    likely blocked by a modal dialog (process alive but bridge unresponsive).
+    """
+    proc = _procs.get(port)
+    proc_alive = proc is not None and proc.poll() is None
+    exit_code = None if proc is None else proc.poll()
+
+    bridge_ok = False
+    timed_out = False
+    bridge_url = f"http://127.0.0.1:{port}"
+    try:
+        r = httpx.get(f"{bridge_url}/app", timeout=2)
+        bridge_ok = r.status_code == 200
+    except (httpx.ConnectTimeout, httpx.ReadTimeout):
+        timed_out = True
+    except httpx.HTTPError:
+        bridge_ok = False
+
+    status = _app_status_from(proc_alive, exit_code, bridge_ok, timed_out)
+    if status["likely_modal_block"]:
+        status["hint"] = (
+            "The Qt main thread appears blocked — most likely a modal dialog "
+            "(QDialog.exec()/QMessageBox) is running a nested event loop. "
+            "Tools that marshal to the main thread will time out until it closes."
+        )
+    status["output"] = _read_log_tail(port, 30)
+    return json.dumps(status, indent=2)
+
+
+@mcp.tool()
+def list_actions() -> str:
+    """
+    List all QActions (menu items, toolbar actions) in visible windows with their
+    name, text, shortcut, and enabled/checked state.
+    """
+    return json.dumps(_get("/actions"), indent=2)
+
+
+@mcp.tool()
+def trigger_action(name: str | None = None, text: str | None = None) -> str:
+    """
+    Trigger a QAction directly by objectName (`name`) or visible label (`text`),
+    without clicking through menus. Useful to avoid opening modal menus and to
+    reach toolbar/menu actions reliably. Provide at least one of name/text.
+    """
+    body: dict = {}
+    if name is not None:
+        body["name"] = name
+    if text is not None:
+        body["text"] = text
+    return json.dumps(_post("/action", body))
 
 
 @mcp.tool()
