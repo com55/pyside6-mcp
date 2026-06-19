@@ -51,4 +51,5 @@ def main() -> None:
         runpy.run_path(args[0], run_name="__main__")
 
 
-main()
+if __name__ == "__main__":
+    main()

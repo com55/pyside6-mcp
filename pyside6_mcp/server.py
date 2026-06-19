@@ -504,7 +504,7 @@ def launch_app(
                         "log_file": log_path,
                         "ready": last_ready,
                     })
-        except (httpx.ConnectError, httpx.ConnectTimeout):
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ReadError):
             pass
         time.sleep(0.4)
 
